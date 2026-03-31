@@ -1,0 +1,159 @@
+
+================================================================================
+   ███████╗███████╗██████╗ ██╗   ██╗██╗ ██████╗███████╗    ███████╗ █████╗ ██████╗
+   ██╔════╝██╔════╝██╔══██╗██║   ██║██║██╔════╝██╔════╝    ██╔════╝██╔══██╗██╔══██╗
+   ███████╗█████╗  ██████╔╝██║   ██║██║██║     █████╗      ███████╗███████║██████╔╝
+   ╚════██║██╔══╝  ██╔══██╗╚██╗ ██╔╝██║██║     ██╔══╝      ╚════██║██╔══██║██╔══██╗
+   ███████║███████╗██║  ██║ ╚████╔╝ ██║╚██████╗███████╗    ███████║██║  ██║██████╔╝
+   ╚══════╝╚══════╝╚═╝  ╚═╝  ╚═══╝  ╚═╝ ╚═════╝╚══════╝    ╚══════╝╚═╝  ╚═╝╚═════╝
+================================================================================
+   AlloyDB AI Support Ticket Query System — Deployment Reference
+   Project: track-3-project  |  Region: us-central1  |  Stack: AlloyDB + Flask + Cloud Run
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  🌐  DEPLOYED SERVICE URL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  https://supportdesk-nl-api-260584325793.us-central1.run.app
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📋  ALL ENDPOINTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  🏠  Root (Service Info)
+      https://supportdesk-nl-api-260584325793.us-central1.run.app/
+
+  ✅  Health Check
+      https://supportdesk-nl-api-260584325793.us-central1.run.app/healthz
+
+  🎫  Query 1 — Open High/Critical Payments Tickets (Since Mar 2026)
+      https://supportdesk-nl-api-260584325793.us-central1.run.app/demo/payments-open
+
+  📊  Query 2 — Unresolved Ticket Count Per Service
+      https://supportdesk-nl-api-260584325793.us-central1.run.app/demo/unresolved-by-service
+
+  👨‍💻  Query 3 — Engineer on Critical Open Auth Tickets
+      https://supportdesk-nl-api-260584325793.us-central1.run.app/demo/critical-auth
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  🚀  BEAUTIFUL STATUS CHECK COMMAND (Run this in Cloud Shell)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Paste this entire block into Cloud Shell to get a beautiful summary:
+
+─────────────────────────────────────────────────────────────────────────────────
+export BASE="https://supportdesk-nl-api-260584325793.us-central1.run.app"
+
+# Colors
+GRN='\033[0;32m'; YLW='\033[1;33m'; CYN='\033[0;36m'
+MGN='\033[0;35m'; RED='\033[0;31m'; BLD='\033[1m'; NC='\033[0m'
+
+clear
+echo -e "${CYN}${BLD}"
+echo "  ╔══════════════════════════════════════════════════════════════════╗"
+echo "  ║       AlloyDB AI  —  Support Ticket Query System                ║"
+echo "  ║       Live Deployment Status Report                             ║"
+echo "  ╚══════════════════════════════════════════════════════════════════╝"
+echo -e "${NC}"
+echo -e "${YLW}  🌐  Service: ${BASE}${NC}"
+echo ""
+
+# ── Health Check ──────────────────────────────────────────────────────────────
+echo -e "${MGN}  ┌─ ✅  HEALTH CHECK ─────────────────────────────────────────────┐${NC}"
+HEALTH=$(curl -s "${BASE}/healthz")
+DB=$(echo $HEALTH | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('database','N/A'))" 2>/dev/null)
+TS=$(echo $HEALTH | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('timestamp','N/A')[:19])" 2>/dev/null)
+ST=$(echo $HEALTH | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','error'))" 2>/dev/null)
+if [ "$ST" = "healthy" ]; then
+  echo -e "${MGN}  │${NC}  Status    : ${GRN}● HEALTHY${NC}"
+else
+  echo -e "${MGN}  │${NC}  Status    : ${RED}● UNHEALTHY${NC}"
+fi
+echo -e "${MGN}  │${NC}  Database  : ${GRN}${DB}${NC}"
+echo -e "${MGN}  │${NC}  Timestamp : ${DB:+${TS}}${NC}"
+echo -e "${MGN}  └────────────────────────────────────────────────────────────────┘${NC}"
+echo ""
+
+# ── Query 1 ───────────────────────────────────────────────────────────────────
+echo -e "${CYN}  ┌─ 🎫  QUERY 1 : Open High/Critical Payments Tickets (Mar 2026+) ┐${NC}"
+Q1=$(curl -s "${BASE}/demo/payments-open")
+CNT=$(echo $Q1 | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('count',0))" 2>/dev/null)
+echo -e "${CYN}  │${NC}  Total Matching Tickets : ${GRN}${BLD}${CNT}${NC}"
+echo $Q1 | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for r in d.get('results', []):
+    print(f\"  │  ▸ Ticket #{r['ticket_id']} | {r['customer_name']:<15} | {r['priority']:<8} | {r['status']:<12} | {r['assigned_engineer']}\")
+" 2>/dev/null
+echo -e "${CYN}  └────────────────────────────────────────────────────────────────┘${NC}"
+echo ""
+
+# ── Query 2 ───────────────────────────────────────────────────────────────────
+echo -e "${YLW}  ┌─ 📊  QUERY 2 : Unresolved Tickets by Service ─────────────────┐${NC}"
+Q2=$(curl -s "${BASE}/demo/unresolved-by-service")
+echo $Q2 | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for r in d.get('results', []):
+    bar = '█' * int(r['unresolved_count']) * 5
+    print(f\"  │  ▸ {r['service_name']:<12} : {r['unresolved_count']} unresolved  {bar}\")
+" 2>/dev/null
+echo -e "${YLW}  └────────────────────────────────────────────────────────────────┘${NC}"
+echo ""
+
+# ── Query 3 ───────────────────────────────────────────────────────────────────
+echo -e "${RED}  ┌─ 👨‍💻  QUERY 3 : Critical Open Auth Tickets ──────────────────────┐${NC}"
+Q3=$(curl -s "${BASE}/demo/critical-auth")
+echo $Q3 | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for r in d.get('results', []):
+    print(f\"  │  ▸ Engineer : {r['assigned_engineer']}\")
+    print(f\"  │    Ticket  : #{r['ticket_id']}\")
+    print(f\"  │    Issue   : {r['issue_summary']}\")
+" 2>/dev/null
+echo -e "${RED}  └────────────────────────────────────────────────────────────────┘${NC}"
+echo ""
+
+# ── Final Summary ─────────────────────────────────────────────────────────────
+echo -e "${GRN}${BLD}"
+echo "  ╔══════════════════════════════════════════════════════════════════╗"
+echo "  ║  ✨  ALL SYSTEMS OPERATIONAL — AlloyDB AI is Live & Running!    ║"
+echo "  ║                                                                  ║"
+echo "  ║  Database  : AlloyDB PostgreSQL 17 (supportdesk)                ║"
+echo "  ║  Dataset   : 8 Custom Software Support Tickets                  ║"
+echo "  ║  API       : Flask + Gunicorn on Cloud Run                      ║"
+echo "  ║  NL Layer  : AlloyDB AI NL (supportdesk_cfg)                    ║"
+echo "  ║  Project   : track-3-project | us-central1                      ║"
+echo "  ╚══════════════════════════════════════════════════════════════════╝"
+echo -e "${NC}"
+─────────────────────────────────────────────────────────────────────────────────
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📌  QUICK CURL (Single-line checks)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  curl -s https://supportdesk-nl-api-260584325793.us-central1.run.app/healthz
+  curl -s https://supportdesk-nl-api-260584325793.us-central1.run.app/demo/payments-open
+  curl -s https://supportdesk-nl-api-260584325793.us-central1.run.app/demo/unresolved-by-service
+  curl -s https://supportdesk-nl-api-260584325793.us-central1.run.app/demo/critical-auth
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📦  EXPECTED OUTPUT SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  /healthz              → status: healthy | database: supportdesk
+  /demo/payments-open   → 2 tickets (Alice Chen #1001, Omar Hassan #1004)
+  /demo/unresolved-by-service → auth: 2, payments: 2
+  /demo/critical-auth   → Daniel Roy | Ticket #1007 | SSO login fails
+
+
+================================================================================
+  Created: March 2026  |  Project: track-3-project  |  By: Sai Ashribad
+================================================================================

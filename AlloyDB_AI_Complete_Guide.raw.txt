@@ -1,0 +1,974 @@
+cat > ~/AlloyDB_AI_Complete_Guide.txt << 'EOF'
+================================================================================
+AlloyDB AI Support Ticket Query System - Complete Deployment Guide
+================================================================================
+
+PROJECT OVERVIEW
+----------------
+This guide contains every command needed to deploy an AI-enabled support ticket
+query system using AlloyDB for PostgreSQL with natural language capabilities.
+
+Dataset: Custom software support tickets (NOT the default retail sample)
+Stack: AlloyDB PostgreSQL 17 + AlloyDB AI NL + Cloud Run + Flask API
+Result: Public HTTPS endpoints returning JSON query results
+
+ONE-SENTENCE USE CASE:
+A support operations analyst can ask natural language questions about software
+support tickets stored in AlloyDB and receive SQL-backed results for triage.
+
+
+================================================================================
+SECTION 1: GCP PROJECT SETUP
+================================================================================
+
+1.1 SET VARIABLES
+-----------------
+IMPORTANT: Replace <YOUR_PROJECT_ID> and <YOUR_PASSWORD> with real values
+
+export PROJECT_ID="<YOUR_PROJECT_ID>"
+export REGION="us-central1"
+export ZONE="us-central1-a"
+export NETWORK="default"
+export SUBNET="default"
+export RESERVED_RANGE_NAME="alloydb-range-supportdesk"
+export CLUSTER_ID="supportdesk-cluster"
+export INSTANCE_ID="supportdesk-primary"
+export DB_NAME="supportdesk"
+export DB_USER="postgres"
+export DB_PASSWORD="<YOUR_STRONG_PASSWORD>"
+export SERVICE_NAME="supportdesk-nl-api"
+
+gcloud config set project "${PROJECT_ID}"
+
+export PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" \
+  --format='value(projectNumber)')"
+
+export INSTANCE_URI="projects/${PROJECT_ID}/locations/${REGION}/clusters/${CLUSTER_ID}/instances/${INSTANCE_ID}"
+
+# Verify
+printf "PROJECT_ID=%s\nREGION=%s\nPROJECT_NUMBER=%s\n" \
+  "${PROJECT_ID}" "${REGION}" "${PROJECT_NUMBER}"
+
+
+1.2 ENABLE APIS
+---------------
+gcloud services enable \
+  alloydb.googleapis.com \
+  compute.googleapis.com \
+  servicenetworking.googleapis.com \
+  aiplatform.googleapis.com \
+  run.googleapis.com \
+  cloudbuild.googleapis.com \
+  artifactregistry.googleapis.com
+
+
+================================================================================
+SECTION 2: CREATE ALLOYDB CLUSTER AND INSTANCE
+================================================================================
+
+2.1 RESERVE PRIVATE SERVICE ACCESS RANGE
+-----------------------------------------
+gcloud compute addresses create "${RESERVED_RANGE_NAME}" \
+  --global \
+  --purpose=VPC_PEERING \
+  --prefix-length=16 \
+  --network="${NETWORK}"
+
+
+2.2 CREATE VPC PEERING CONNECTION
+----------------------------------
+gcloud services vpc-peerings connect \
+  --service=servicenetworking.googleapis.com \
+  --ranges="${RESERVED_RANGE_NAME}" \
+  --network="${NETWORK}"
+
+
+2.3 CREATE ALLOYDB CLUSTER
+---------------------------
+gcloud alloydb clusters create "${CLUSTER_ID}" \
+  --database-version=POSTGRES_17 \
+  --password="${DB_PASSWORD}" \
+  --region="${REGION}" \
+  --project="${PROJECT_ID}" \
+  --network="${NETWORK}"
+
+
+2.4 CREATE ALLOYDB INSTANCE WITH PUBLIC IP
+-------------------------------------------
+⚠️ CRITICAL: Must include password.enforce_complexity=on when using public IP
+
+gcloud alloydb instances create "${INSTANCE_ID}" \
+  --instance-type=PRIMARY \
+  --availability-type=ZONAL \
+  --cpu-count=2 \
+  --region="${REGION}" \
+  --cluster="${CLUSTER_ID}" \
+  --project="${PROJECT_ID}" \
+  --assign-inbound-public-ip=ASSIGN_IPV4 \
+  --database-flags=password.enforce_complexity=on
+
+
+2.5 WAIT FOR INSTANCE TO BE READY
+----------------------------------
+# Check status
+gcloud alloydb instances describe "${INSTANCE_ID}" \
+  --cluster="${CLUSTER_ID}" \
+  --region="${REGION}" \
+  --project="${PROJECT_ID}" \
+  --format="value(state)"
+
+# Expected: READY
+
+
+================================================================================
+SECTION 3: CONNECT TO ALLOYDB
+================================================================================
+
+3.1 START ALLOYDB AUTH PROXY
+-----------------------------
+⚠️ CRITICAL: Do NOT use sslmode=require with proxy on localhost
+
+# Kill any old proxy
+pkill -f alloydb-auth-proxy || true
+
+# Start proxy
+alloydb-auth-proxy "${INSTANCE_URI}" --public-ip > /tmp/alloydb-proxy.log 2>&1 &
+sleep 15
+
+# Check proxy logs
+cat /tmp/alloydb-proxy.log
+
+# Verify proxy is listening
+ss -ltn | grep 5432 || netstat -ltn | grep 5432
+
+
+3.2 TEST CONNECTION
+-------------------
+⚠️ CRITICAL: Do NOT use sslmode=require
+
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d postgres \
+  -c "SELECT now();"
+
+# Expected: Current timestamp displayed
+
+
+================================================================================
+SECTION 4: CREATE DATABASE AND SCHEMA
+================================================================================
+
+4.1 CREATE DATABASE
+-------------------
+⚠️ CRITICAL: Do NOT use psql -lqt (causes error on PostgreSQL 17)
+
+# Check if database exists
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d postgres \
+  -tAc "SELECT 1 FROM pg_database WHERE datname='supportdesk';"
+
+# If returns nothing, create it
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d postgres \
+  -c "CREATE DATABASE supportdesk;"
+
+# Verify
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d postgres \
+  -c "SELECT datname FROM pg_database WHERE datname='supportdesk';"
+
+
+4.2 CREATE SCHEMA AND TABLE
+----------------------------
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d supportdesk <<'SQL'
+CREATE SCHEMA IF NOT EXISTS app;
+
+CREATE TABLE IF NOT EXISTS app.support_tickets (
+    ticket_id BIGINT PRIMARY KEY,
+    customer_name TEXT NOT NULL,
+    service_name TEXT NOT NULL,
+    priority TEXT NOT NULL CHECK (priority IN ('Low','Medium','High','Critical')),
+    status TEXT NOT NULL CHECK (status IN ('Open','In Progress','Resolved','Closed')),
+    issue_summary TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    resolved_at TIMESTAMP NULL,
+    assigned_engineer TEXT NOT NULL,
+    satisfaction_score INT NULL CHECK (satisfaction_score BETWEEN 1 AND 5)
+);
+
+COMMENT ON TABLE app.support_tickets IS 
+  'Software support tickets raised by customers for services such as payments, auth, search, and analytics.';
+COMMENT ON COLUMN app.support_tickets.service_name IS 
+  'Affected application service such as payments, auth, search, or analytics.';
+COMMENT ON COLUMN app.support_tickets.priority IS 
+  'Ticket urgency with values Low, Medium, High, and Critical.';
+COMMENT ON COLUMN app.support_tickets.status IS 
+  'Workflow state with values Open, In Progress, Resolved, and Closed.';
+SQL
+
+
+4.3 INSERT CUSTOM DATASET
+--------------------------
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d supportdesk <<'SQL'
+INSERT INTO app.support_tickets VALUES
+(1001,'Alice Chen',  'payments', 'Critical','Open',       'Checkout API returns 502 for Visa payments',               '2026-03-01 09:15:00',NULL,                  'Ravi Kumar',NULL),
+(1002,'Marcus Lee',  'search',   'Medium',  'Resolved',   'Autocomplete suggestions missing for partial keywords',    '2026-02-18 14:20:00','2026-02-19 11:00:00','Priya Nair', 4),
+(1003,'Sofia Patel', 'auth',     'High',    'In Progress','Password reset emails delayed by more than 10 minutes',   '2026-03-10 08:40:00',NULL,                  'Daniel Roy', NULL),
+(1004,'Omar Hassan', 'payments', 'High',    'Open',       'Refund status not visible in the customer portal',        '2026-03-12 16:05:00',NULL,                  'Ravi Kumar', NULL),
+(1005,'Elena Garcia','analytics','Low',     'Closed',     'Dashboard CSV export column alignment issue',             '2026-01-25 10:10:00','2026-01-27 12:30:00','Mei Wong',   5),
+(1006,'Noah Smith',  'payments', 'Medium',  'Resolved',   'UPI payment webhook retries are duplicated',              '2026-02-28 13:00:00','2026-03-02 09:30:00','Ravi Kumar', 4),
+(1007,'Priyanka Das','auth',     'Critical','Open',       'SSO login fails for newly invited users',                 '2026-03-15 11:25:00',NULL,                  'Daniel Roy', NULL),
+(1008,'Ethan Brown', 'search',   'High',    'Closed',     'Archived products appear above active products in search','2026-02-08 15:45:00','2026-02-10 17:15:00','Priya Nair', 3)
+ON CONFLICT (ticket_id) DO NOTHING;
+
+SELECT COUNT(*) AS total_rows FROM app.support_tickets;
+SQL
+
+# Expected: 8 rows
+
+
+================================================================================
+SECTION 5: ENABLE ALLOYDB AI NATURAL LANGUAGE
+================================================================================
+
+5.1 GRANT VERTEX AI ACCESS TO ALLOYDB
+--------------------------------------
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-alloydb.iam.gserviceaccount.com" \
+  --role="roles/aiplatform.user"
+
+
+5.2 UPDATE INSTANCE FLAGS
+--------------------------
+⚠️ CRITICAL: Use alloydb_ai_nl.enabled=on (NOT alloydb.ai_nl_enabled)
+
+gcloud alloydb instances update "${INSTANCE_ID}" \
+  --cluster="${CLUSTER_ID}" \
+  --region="${REGION}" \
+  --project="${PROJECT_ID}" \
+  --database-flags=password.enforce_complexity=on,alloydb_ai_nl.enabled=on,google_ml_integration.enable_model_support=on
+
+
+5.3 WAIT FOR INSTANCE READY
+----------------------------
+# If you get "ABORTED: unable to queue the operation", wait and retry
+
+# Check state
+gcloud alloydb instances describe "${INSTANCE_ID}" \
+  --cluster="${CLUSTER_ID}" \
+  --region="${REGION}" \
+  --project="${PROJECT_ID}" \
+  --format="value(state)"
+
+# Wait until it shows READY
+
+
+5.4 RESTART PROXY
+-----------------
+pkill -f alloydb-auth-proxy || true
+sleep 10
+alloydb-auth-proxy "${INSTANCE_URI}" --public-ip > /tmp/alloydb-proxy.log 2>&1 &
+sleep 20
+cat /tmp/alloydb-proxy.log
+
+
+5.5 VERIFY FLAG IS ENABLED IN DATABASE
+---------------------------------------
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d supportdesk \
+  -c "SHOW alloydb_ai_nl.enabled;"
+
+# Expected: on
+
+
+5.6 INSTALL EXTENSIONS
+----------------------
+⚠️ CRITICAL: Do NOT run ALTER EXTENSION google_ml_integration UPDATE
+
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d supportdesk <<'SQL'
+CREATE EXTENSION IF NOT EXISTS google_ml_integration;
+CREATE EXTENSION IF NOT EXISTS alloydb_ai_nl CASCADE;
+
+SET google_ml_integration.enable_ai_query_engine = true;
+ALTER ROLE postgres SET google_ml_integration.enable_ai_query_engine = 'on';
+SQL
+
+
+5.7 VERIFY EXTENSIONS INSTALLED
+--------------------------------
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d supportdesk \
+  -c "SELECT extname, extversion FROM pg_extension WHERE extname IN ('google_ml_integration','alloydb_ai_nl');"
+
+# Expected: Both extensions listed
+
+
+================================================================================
+SECTION 6: CONFIGURE ALLOYDB AI NATURAL LANGUAGE
+================================================================================
+
+6.1 CREATE NL CONFIGURATION
+----------------------------
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d supportdesk <<'SQL'
+SELECT alloydb_ai_nl.g_create_configuration('supportdesk_cfg');
+
+SELECT alloydb_ai_nl.g_manage_configuration(
+  operation           => 'register_table_view',
+  configuration_id_in => 'supportdesk_cfg',
+  table_views_in      => '{app.support_tickets}'
+);
+SQL
+
+
+6.2 SET MANUAL CONTEXT
+-----------------------
+⚠️ CRITICAL: Use manual context to avoid Vertex AI model 404 errors
+
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d supportdesk <<'SQL'
+SELECT alloydb_ai_nl.set_relation_context(
+  'app.support_tickets',
+  'This table stores software support tickets raised by customers for services such as payments, auth, search, and analytics.'
+);
+
+SELECT alloydb_ai_nl.set_column_context(
+  'app.support_tickets.service_name',
+  'Affected application service such as payments, auth, search, or analytics.'
+);
+
+SELECT alloydb_ai_nl.set_column_context(
+  'app.support_tickets.priority',
+  'Ticket urgency with values Low, Medium, High, and Critical.'
+);
+
+SELECT alloydb_ai_nl.set_column_context(
+  'app.support_tickets.status',
+  'Workflow state with values Open, In Progress, Resolved, and Closed.'
+);
+SQL
+
+
+6.3 CREATE CONCEPT TYPES AND VALUE INDEX
+-----------------------------------------
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d supportdesk <<'SQL'
+SELECT alloydb_ai_nl.add_concept_type(
+  concept_type_in    => 'service_name',
+  match_function_in  => 'alloydb_ai_nl.get_concept_and_value_generic_entity_name',
+  additional_info_in => '{"description":"Application service names."}'::jsonb
+);
+SELECT alloydb_ai_nl.associate_concept_type(
+  'app.support_tickets.service_name','service_name','supportdesk_cfg');
+
+SELECT alloydb_ai_nl.add_concept_type(
+  concept_type_in    => 'ticket_priority',
+  match_function_in  => 'alloydb_ai_nl.get_concept_and_value_generic_entity_name',
+  additional_info_in => '{"description":"Ticket priority values."}'::jsonb
+);
+SELECT alloydb_ai_nl.associate_concept_type(
+  'app.support_tickets.priority','ticket_priority','supportdesk_cfg');
+
+SELECT alloydb_ai_nl.add_concept_type(
+  concept_type_in    => 'ticket_status',
+  match_function_in  => 'alloydb_ai_nl.get_concept_and_value_generic_entity_name',
+  additional_info_in => '{"description":"Ticket status values."}'::jsonb
+);
+SELECT alloydb_ai_nl.associate_concept_type(
+  'app.support_tickets.status','ticket_status','supportdesk_cfg');
+
+SELECT alloydb_ai_nl.create_value_index('supportdesk_cfg');
+SELECT alloydb_ai_nl.refresh_value_index('supportdesk_cfg');
+SQL
+
+
+6.4 ADD QUERY TEMPLATE
+-----------------------
+⚠️ CRITICAL: Use check_intent => FALSE to avoid Vertex AI model errors
+
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d supportdesk <<'SQL'
+SELECT alloydb_ai_nl.add_template(
+  nl_config_id    => 'supportdesk_cfg',
+  intent          => 'Show open high or critical tickets for the payments service created on or after 2026-03-01.',
+  sql             => $$
+    SELECT ticket_id, customer_name, service_name, priority, status, created_at, assigned_engineer
+    FROM app.support_tickets
+    WHERE service_name = 'payments'
+      AND status = 'Open'
+      AND priority IN ('High', 'Critical')
+      AND created_at >= TIMESTAMP '2026-03-01 00:00:00'
+    ORDER BY created_at ASC
+  $$,
+  sql_explanation => 'Return open high or critical payments tickets created on or after 2026-03-01.',
+  check_intent    => FALSE
+);
+SQL
+
+
+6.5 VERIFY TEMPLATE REGISTERED
+-------------------------------
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d supportdesk \
+  -c "SELECT nl, intent FROM alloydb_ai_nl.template_store_view WHERE config='supportdesk_cfg';"
+
+
+================================================================================
+SECTION 7: TEST QUERIES
+================================================================================
+
+7.1 EXECUTE SQL QUERIES DIRECTLY
+---------------------------------
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d supportdesk <<'SQL'
+-- Query 1: Open critical/high payments tickets since March 2026
+SELECT ticket_id, customer_name, service_name, priority, status, created_at, assigned_engineer
+FROM app.support_tickets
+WHERE service_name = 'payments'
+  AND status = 'Open'
+  AND priority IN ('High', 'Critical')
+  AND created_at >= TIMESTAMP '2026-03-01 00:00:00'
+ORDER BY created_at ASC;
+
+-- Query 2: Unresolved ticket count per service
+SELECT service_name, COUNT(*) AS unresolved_count
+FROM app.support_tickets
+WHERE status IN ('Open', 'In Progress')
+GROUP BY service_name
+ORDER BY unresolved_count DESC;
+
+-- Query 3: Engineer on open critical auth tickets
+SELECT assigned_engineer, ticket_id, issue_summary
+FROM app.support_tickets
+WHERE service_name = 'auth'
+  AND priority = 'Critical'
+  AND status = 'Open';
+SQL
+
+EXPECTED RESULTS:
+Query 1: Tickets 1001 (Alice Chen, Critical) and 1004 (Omar Hassan, High)
+Query 2: auth=2, payments=2
+Query 3: Daniel Roy, ticket 1007
+
+
+================================================================================
+SECTION 8: DEPLOY CLOUD RUN WEB API
+================================================================================
+
+8.1 GET ALLOYDB PRIVATE IP
+---------------------------
+export INSTANCE_HOST="$(gcloud alloydb instances describe "${INSTANCE_ID}" \
+  --cluster="${CLUSTER_ID}" \
+  --region="${REGION}" \
+  --project="${PROJECT_ID}" \
+  --format='value(ipAddress)')"
+
+echo "AlloyDB Private IP: ${INSTANCE_HOST}"
+
+
+8.2 GRANT VPC ACCESS TO CLOUD RUN
+----------------------------------
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:service-${PROJECT_NUMBER}@serverless-robot-prod.iam.gserviceaccount.com" \
+  --role="roles/compute.networkUser"
+
+
+8.3 GRANT CLOUD BUILD PERMISSIONS
+----------------------------------
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --role="roles/storage.objectViewer"
+
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --role="roles/cloudbuild.builds.builder"
+
+# Wait 30 seconds for IAM propagation
+sleep 30
+
+
+8.4 CREATE APP DIRECTORY AND FILES
+-----------------------------------
+mkdir -p ~/supportdesk-cloud-run
+cd ~/supportdesk-cloud-run
+
+
+8.5 CREATE app.py
+-----------------
+cat > app.py << 'PYEOF'
+import os
+from flask import Flask, jsonify, request
+import psycopg2
+import psycopg2.extras
+
+app = Flask(__name__)
+
+DB_HOST = os.environ.get("INSTANCE_HOST", "127.0.0.1")
+DB_PORT = int(os.environ.get("DB_PORT", "5432"))
+DB_NAME = os.environ.get("DB_NAME", "supportdesk")
+DB_USER = os.environ.get("DB_USER", "postgres")
+DB_PASS = os.environ.get("DB_PASS", "")
+
+def get_conn():
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS,
+        connect_timeout=10
+    )
+
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({
+        "service": "supportdesk-nl-api",
+        "status": "running",
+        "endpoints": [
+            "/healthz",
+            "/demo/payments-open",
+            "/demo/unresolved-by-service",
+            "/demo/critical-auth"
+        ]
+    }), 200
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT current_database(), now()")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "status": "healthy",
+            "database": row[0],
+            "timestamp": str(row[1]),
+            "db_host": DB_HOST
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e)
+        }), 500
+
+@app.route("/demo/payments-open", methods=["GET"])
+def demo_payments_open():
+    sql = """
+        SELECT ticket_id, customer_name, service_name, priority, status,
+               created_at::text AS created_at, assigned_engineer
+        FROM app.support_tickets
+        WHERE service_name = 'payments'
+          AND status = 'Open'
+          AND priority IN ('High', 'Critical')
+          AND created_at >= TIMESTAMP '2026-03-01 00:00:00'
+        ORDER BY created_at ASC
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return jsonify({
+            "query": "Show open high or critical tickets for payments service",
+            "count": len(rows),
+            "results": rows
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/demo/unresolved-by-service", methods=["GET"])
+def demo_unresolved():
+    sql = """
+        SELECT service_name, COUNT(*) AS unresolved_count
+        FROM app.support_tickets
+        WHERE status IN ('Open', 'In Progress')
+        GROUP BY service_name
+        ORDER BY unresolved_count DESC
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return jsonify({
+            "query": "Unresolved tickets by service",
+            "count": len(rows),
+            "results": rows
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/demo/critical-auth", methods=["GET"])
+def demo_critical_auth():
+    sql = """
+        SELECT assigned_engineer, ticket_id, issue_summary
+        FROM app.support_tickets
+        WHERE service_name = 'auth'
+          AND priority = 'Critical'
+          AND status = 'Open'
+    """
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return jsonify({
+            "query": "Critical auth tickets",
+            "count": len(rows),
+            "results": rows
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({
+        "error": "Not found",
+        "available_routes": [
+            "/",
+            "/healthz",
+            "/demo/payments-open",
+            "/demo/unresolved-by-service",
+            "/demo/critical-auth"
+        ]
+    }), 404
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port, debug=False)
+PYEOF
+
+
+8.6 CREATE requirements.txt
+----------------------------
+cat > requirements.txt << 'TXT'
+Flask==3.0.3
+gunicorn==21.2.0
+psycopg2-binary==2.9.9
+TXT
+
+
+8.7 CREATE Dockerfile
+----------------------
+cat > Dockerfile << 'DOCKER'
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+EXPOSE 8080
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "4", "--timeout", "120", "app:app"]
+DOCKER
+
+
+8.8 VERIFY FILES CREATED
+-------------------------
+ls -la ~/supportdesk-cloud-run/
+
+# Expected: app.py, requirements.txt, Dockerfile
+
+
+8.9 DEPLOY TO CLOUD RUN
+------------------------
+cd ~/supportdesk-cloud-run
+
+gcloud run deploy "${SERVICE_NAME}" \
+  --source . \
+  --region "${REGION}" \
+  --allow-unauthenticated \
+  --network "${NETWORK}" \
+  --subnet "${SUBNET}" \
+  --vpc-egress private-ranges-only \
+  --set-env-vars "DB_NAME=${DB_NAME},DB_USER=${DB_USER},DB_PASS=${DB_PASSWORD},DB_PORT=5432,INSTANCE_HOST=${INSTANCE_HOST}" \
+  --min-instances=1
+
+# This takes 2-4 minutes
+# Expected output: Service URL: https://supportdesk-nl-api-xxxxx-uc.a.run.app
+
+
+8.10 GET SERVICE URL
+--------------------
+export SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
+  --region="${REGION}" \
+  --format='value(status.url)')"
+
+echo "Your Live URL: ${SERVICE_URL}"
+
+
+8.11 TEST ALL ENDPOINTS
+------------------------
+# Test 1: Root
+curl -s "${SERVICE_URL}/" | python3 -m json.tool
+
+# Test 2: Health Check
+curl -s "${SERVICE_URL}/healthz" | python3 -m json.tool
+
+# Test 3: Payments Query
+curl -s "${SERVICE_URL}/demo/payments-open" | python3 -m json.tool
+
+# Test 4: Unresolved Tickets
+curl -s "${SERVICE_URL}/demo/unresolved-by-service" | python3 -m json.tool
+
+# Test 5: Critical Auth
+curl -s "${SERVICE_URL}/demo/critical-auth" | python3 -m json.tool
+
+
+================================================================================
+SECTION 9: ALL ERRORS AND SOLUTIONS
+================================================================================
+
+ERROR 1: password complexity flag is required when public IP is enabled
+------------------------------------------------------------------------
+CAUSE: Creating instance with public IP without password complexity flag
+FIX: Add --database-flags=password.enforce_complexity=on at instance creation
+
+
+ERROR 2: server does not support SSL, but SSL was required
+-----------------------------------------------------------
+CAUSE: Used sslmode=require with alloydb-auth-proxy on localhost
+FIX: Remove sslmode=require; proxy handles SSL automatically
+
+
+ERROR 3: connection refused
+----------------------------
+CAUSE: Proxy not started or crashed
+FIX: pkill -f alloydb-auth-proxy; restart proxy; wait 15 seconds
+
+
+ERROR 4: column d.daticulocale does not exist
+----------------------------------------------
+CAUSE: Used psql -lqt on PostgreSQL 17
+FIX: Query pg_database directly instead
+
+
+ERROR 5: DB flag with name "alloydb.ai_nl_enabled" does not exist
+------------------------------------------------------------------
+CAUSE: Wrong flag name (dot instead of underscore)
+FIX: Use alloydb_ai_nl.enabled=on
+
+
+ERROR 6: ABORTED: unable to queue the operation
+------------------------------------------------
+CAUSE: Another operation already running on instance
+FIX: Wait for instance state to be READY, then retry
+
+
+ERROR 7: must be owner of extension google_ml_integration
+----------------------------------------------------------
+CAUSE: Ran ALTER EXTENSION google_ml_integration UPDATE as non-owner
+FIX: Never run that command; skip it entirely
+
+
+ERROR 8: schema "alloydb_ai_nl" does not exist
+-----------------------------------------------
+CAUSE: Extension created before flag took effect
+FIX: Enable flag → restart proxy → then create extension
+
+
+ERROR 9: Resource not found for the prediction request
+-------------------------------------------------------
+CAUSE: Vertex AI model endpoint not available (gemini-1.5-pro 404)
+FIX: Set context manually; use check_intent => FALSE in add_template
+
+
+ERROR 10: Cloud Run returns 404 on /healthz
+--------------------------------------------
+CAUSE: Old code with psycopg (not psycopg2) still deployed
+FIX: Redeploy with psycopg2-binary in requirements.txt
+
+
+ERROR 11: HTTPError 404 when describing AlloyDB operation
+----------------------------------------------------------
+CAUSE: Used full operation path with --region flag (duplicated path)
+FIX: Use only operation ID, not full projects/.../operations/... path
+
+
+ERROR 12: Cloud Build permission denied (storage.objects.get)
+--------------------------------------------------------------
+CAUSE: Cloud Build service account needs Storage access
+FIX: Grant roles/storage.objectViewer and roles/cloudbuild.builds.builder
+
+
+================================================================================
+SECTION 10: TROUBLESHOOTING COMMANDS
+================================================================================
+
+10.1 CHECK INSTANCE STATUS
+---------------------------
+gcloud alloydb instances describe "${INSTANCE_ID}" \
+  --cluster="${CLUSTER_ID}" \
+  --region="${REGION}" \
+  --format="yaml(state,publicIpAddress,databaseFlags)"
+
+
+10.2 CHECK PROXY STATUS
+------------------------
+cat /tmp/alloydb-proxy.log
+ss -ltn | grep 5432 || netstat -ltn | grep 5432
+ps aux | grep alloydb-auth-proxy
+
+
+10.3 CHECK EXTENSIONS
+----------------------
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d supportdesk \
+  -c "SELECT extname, extversion FROM pg_extension ORDER BY extname;"
+
+
+10.4 CHECK DATABASE FLAG
+-------------------------
+PGPASSWORD="${DB_PASSWORD}" psql -h 127.0.0.1 -p 5432 -U "${DB_USER}" -d supportdesk \
+  -c "SHOW alloydb_ai_nl.enabled;"
+
+
+10.5 CHECK CLOUD RUN LOGS
+--------------------------
+gcloud logging read \
+  "resource.type=cloud_run_revision AND resource.labels.service_name=${SERVICE_NAME}" \
+  --project="${PROJECT_ID}" \
+  --limit=30 \
+  --format="table(timestamp,severity,textPayload)"
+
+
+10.6 LIST CLOUD RUN SERVICES
+-----------------------------
+gcloud run services list \
+  --region="${REGION}" \
+  --format="table(name,status.url,status.conditions[0].status)"
+
+
+10.7 CHECK ALLOYDB OPERATIONS
+------------------------------
+gcloud alloydb operations list \
+  --region="${REGION}" \
+  --project="${PROJECT_ID}" \
+  --sort-by="~metadata.createTime" \
+  --limit=5
+
+
+================================================================================
+SECTION 11: COMPLETE TEST SUITE
+================================================================================
+
+11.1 BEAUTIFUL TEST COMMAND
+----------------------------
+export SERVICE_URL="$(gcloud run services describe supportdesk-nl-api \
+  --region="${REGION}" \
+  --format='value(status.url)')"
+
+echo "════════════════════════════════════════════════════════════════"
+echo "🚀 AlloyDB AI Support Ticket System - Live Test"
+echo "════════════════════════════════════════════════════════════════"
+echo "📍 URL: ${SERVICE_URL}"
+echo ""
+
+echo "━━━ ✅ Health Check ━━━"
+curl -s "${SERVICE_URL}/healthz" | python3 -m json.tool
+echo ""
+
+echo "━━━ 🎫 Query 1: Critical Payments Tickets ━━━"
+curl -s "${SERVICE_URL}/demo/payments-open" | python3 -m json.tool
+echo ""
+
+echo "━━━ 📊 Query 2: Unresolved by Service ━━━"
+curl -s "${SERVICE_URL}/demo/unresolved-by-service" | python3 -m json.tool
+echo ""
+
+echo "━━━ 👨‍💻 Query 3: Critical Auth Engineer ━━━"
+curl -s "${SERVICE_URL}/demo/critical-auth" | python3 -m json.tool
+echo ""
+
+echo "════════════════════════════════════════════════════════════════"
+echo "✨ All Tests Complete!"
+echo "════════════════════════════════════════════════════════════════"
+
+
+11.2 EXPECTED RESULTS
+---------------------
+Health Check:
+  - status: "healthy"
+  - database: "supportdesk"
+  - timestamp: (current time)
+
+Query 1 (Payments):
+  - count: 2
+  - ticket_id: 1001 (Alice Chen, Critical)
+  - ticket_id: 1004 (Omar Hassan, High)
+
+Query 2 (Unresolved):
+  - auth: 2 unresolved
+  - payments: 2 unresolved
+
+Query 3 (Critical Auth):
+  - Engineer: Daniel Roy
+  - Ticket: 1007
+  - Issue: SSO login fails for newly invited users
+
+
+================================================================================
+SECTION 12: SUBMISSION CHECKLIST
+================================================================================
+
+✅ Custom dataset stored in AlloyDB (8 support tickets)
+✅ Dataset different from default lab (support tickets, not retail)
+✅ Custom schema created (app.support_tickets)
+✅ AlloyDB AI NL enabled (alloydb_ai_nl.enabled=on)
+✅ NL configuration created (supportdesk_cfg)
+✅ Query template registered
+✅ Custom NL queries provided
+✅ SQL executed successfully
+✅ Relevant results returned
+✅ Cloud Run API deployed
+✅ Public HTTPS endpoints working
+
+SUBMISSION LINKS:
+------------------
+Live App:    ${SERVICE_URL}
+Health:      ${SERVICE_URL}/healthz
+Query 1:     ${SERVICE_URL}/demo/payments-open
+Query 2:     ${SERVICE_URL}/demo/unresolved-by-service
+Query 3:     ${SERVICE_URL}/demo/critical-auth
+
+
+================================================================================
+SECTION 13: CLEANUP (OPTIONAL)
+================================================================================
+
+13.1 DELETE CLOUD RUN SERVICE
+------------------------------
+gcloud run services delete "${SERVICE_NAME}" \
+  --region="${REGION}" \
+  --quiet
+
+
+13.2 DELETE ALLOYDB INSTANCE AND CLUSTER
+-----------------------------------------
+gcloud alloydb instances delete "${INSTANCE_ID}" \
+  --cluster="${CLUSTER_ID}" \
+  --region="${REGION}" \
+  --quiet
+
+gcloud alloydb clusters delete "${CLUSTER_ID}" \
+  --region="${REGION}" \
+  --quiet
+
+
+13.3 DELETE VPC PEERING
+------------------------
+gcloud services vpc-peerings delete \
+  --service=servicenetworking.googleapis.com \
+  --network="${NETWORK}"
+
+
+13.4 DELETE RESERVED IP RANGE
+------------------------------
+gcloud compute addresses delete "${RESERVED_RANGE_NAME}" \
+  --global \
+  --quiet
+
+
+================================================================================
+END OF GUIDE
+================================================================================
+
+Last Updated: March 2026
+Stack: AlloyDB PostgreSQL 17 + AlloyDB AI NL + Cloud Run + Flask
+Dataset: Custom Support Tickets (8 rows)
+Query Results: JSON via HTTPS endpoints
+
+For issues or questions, review Section 9 (Errors) and Section 10 (Troubleshooting).
+EOF
